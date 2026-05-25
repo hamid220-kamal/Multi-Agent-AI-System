@@ -1,43 +1,43 @@
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from core.state import State
-from core.orchestrator import AgentOrchestrator
-from nodes.planner import planner_node
-from nodes.researcher import researcher_node
-from nodes.critic import critic_node
+from core.schema import SystemState
+from core.engine import AsyncGraphOrchestrator
+from nodes.agents import (
+    planner_agent, researcher_agent, critic_agent,
+    planner_router, researcher_router, critic_router
+)
 
-app = FastAPI(title="Multi-Agent AI System")
+app = FastAPI(title="Advanced Multi-Agent Autonomous Pipeline")
 
-# Initialize orchestrator
-orchestrator = AgentOrchestrator()
+# Initialize and map the graph engine
+orchestrator = AsyncGraphOrchestrator()
 
-# Register nodes
-orchestrator.add_node("planner", planner_node)
-orchestrator.add_node("researcher", researcher_node)
-orchestrator.add_node("critic", critic_node)
+orchestrator.add_node("planner", planner_agent)
+orchestrator.add_node("researcher", researcher_agent)
+orchestrator.add_node("critic", critic_agent)
 
-# Define transitions (Linear flow as example)
-orchestrator.add_edge("planner", "researcher")
-orchestrator.add_edge("researcher", "critic")
+orchestrator.add_conditional_edges("planner", planner_router)
+orchestrator.add_conditional_edges("researcher", researcher_router)
+orchestrator.add_conditional_edges("critic", critic_router)
 
-# Set entry point
 orchestrator.set_entry_point("planner")
 
-class AgentRunRequest(BaseModel):
-    user_intent: str
+class OrchestrateRequest(BaseModel):
+    user_prompt: str
 
-@app.post("/api/v1/agent/run", response_model=State)
-async def run_agent_workflow(request: AgentRunRequest):
+@app.post("/api/v1/agent/orchestrate")
+async def orchestrate_agent(request: OrchestrateRequest):
     """
-    Endpoint to trigger the asynchronous multi-agent orchestration loop.
+    Asynchronous Server-Sent Events (SSE) streaming endpoint.
+    Yields live JSON chunks showing agent-by-agent system status.
     """
-    initial_state = State(
-        current_task="Process intent: " + request.user_intent
-    )
-    initial_state.messages.append({"role": "user", "content": request.user_intent})
+    initial_state = SystemState(user_prompt=request.user_prompt)
     
-    final_state = await orchestrator.run(initial_state)
-    return final_state
+    return StreamingResponse(
+        orchestrator.stream_orchestrate(initial_state),
+        media_type="text/event-stream"
+    )
 
 if __name__ == "__main__":
     import uvicorn
