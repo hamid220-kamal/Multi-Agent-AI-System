@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from core.schema import SystemState
 from core.llm import llm
 from tools.search import search_web
+from core.memory import vector_memory
 
 # ---------------------------------------------------------
 # Pydantic Schemas for Structured LLM Outputs
@@ -55,7 +56,6 @@ async def researcher_agent(state: SystemState) -> SystemState:
     user_msg = f"Overall Objective: {state.user_prompt}\nCurrent Step to Execute: {current_step}"
     
     try:
-        # Ask LLM to determine the search query
         query_output = await llm.generate_structured(
             prompt=user_msg,
             schema=SearchQuerySchema,
@@ -64,18 +64,18 @@ async def researcher_agent(state: SystemState) -> SystemState:
         search_query = query_output.query
         state.agent_logs["researcher"].append(f"Executing search: '{search_query}'")
         
-        # Execute the search tool autonomously
+        # Execute the search tool
         results = await search_web(search_query)
         
-        # Append to shared memory
-        if "research_data" not in state.shared_memory:
-            state.shared_memory["research_data"] = []
-            
-        state.shared_memory["research_data"].append({
-            "step": current_step,
-            "query": search_query,
-            "results": results
-        })
+        # STORE INTO LOCAL RAG MEMORY (Vector DB)
+        for res in results:
+            if isinstance(res, dict) and "body" in res:
+                vector_memory.add_memory(
+                    text=res["body"],
+                    metadata={"query": search_query, "step": current_step, "source": res.get("href", "web")}
+                )
+        
+        state.agent_logs["researcher"].append("Saved findings into Vector DB.")
         
         state.current_step_idx += 1
         state.status = "PROCESSING"
@@ -90,13 +90,14 @@ async def critic_agent(state: SystemState) -> SystemState:
     if "critic" not in state.agent_logs:
         state.agent_logs["critic"] = []
         
-    data = state.shared_memory.get("research_data", [])
+    # RETRIEVE FROM LOCAL RAG MEMORY (Vector DB)
+    state.agent_logs["critic"].append("Querying Vector DB for context...")
+    rag_context = vector_memory.query_memory(state.user_prompt, n_results=5)
     
-    # Simple truncate to avoid massive context window overload for the free cloud model
-    str_data = str(data)[:2500] 
+    str_data = "\n---\n".join(rag_context) if rag_context else "No relevant data found."
     
-    system_prompt = "You are a stringent Critic Agent. Evaluate the provided search results to determine if they satisfy the user's original objective."
-    user_msg = f"Objective: {state.user_prompt}\nData Gathered So Far:\n{str_data}"
+    system_prompt = "You are a stringent Critic Agent. Evaluate the retrieved semantic memory context to determine if it satisfies the user's original objective."
+    user_msg = f"Objective: {state.user_prompt}\nSemantic Memory Gathered:\n{str_data}"
     
     try:
         eval_output = await llm.generate_structured(
@@ -108,7 +109,6 @@ async def critic_agent(state: SystemState) -> SystemState:
         state.agent_logs["critic"].append(f"Evaluation: {eval_output.reason} (Passed: {eval_output.passed})")
         
         if eval_output.passed or state.current_step_idx >= len(state.plan):
-            # If the LLM says it passed, or we exhausted all steps, we complete.
             state.status = "COMPLETED"
         else:
             state.status = "REVISE"
