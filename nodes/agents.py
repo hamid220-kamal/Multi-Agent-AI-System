@@ -52,7 +52,7 @@ async def researcher_agent(state: SystemState) -> SystemState:
     current_step = state.plan[state.current_step_idx] if state.current_step_idx < len(state.plan) else "Finalizing research"
     state.agent_logs["researcher"].append(f"Formulating query for step: {current_step}")
     
-    system_prompt = "You are an expert Researcher Agent. Formulate the best DuckDuckGo web search query to gather data for the current step."
+    system_prompt = "You are an expert Researcher Agent. Formulate the best web search query."
     user_msg = f"Overall Objective: {state.user_prompt}\nCurrent Step to Execute: {current_step}"
     
     try:
@@ -67,12 +67,12 @@ async def researcher_agent(state: SystemState) -> SystemState:
         # Execute the search tool
         results = await search_web(search_query)
         
-        # STORE INTO LOCAL RAG MEMORY (Vector DB)
+        # Store into Vector DB
         for res in results:
             if isinstance(res, dict) and "body" in res:
                 vector_memory.add_memory(
                     text=res["body"],
-                    metadata={"query": search_query, "step": current_step, "source": res.get("href", "web")}
+                    metadata={"query": search_query, "step": current_step}
                 )
         
         state.agent_logs["researcher"].append("Saved findings into Vector DB.")
@@ -86,18 +86,37 @@ async def researcher_agent(state: SystemState) -> SystemState:
         
     return state
 
+async def supervisor_agent(state: SystemState) -> SystemState:
+    """
+    Human-in-the-Loop Node.
+    Pauses orchestration to wait for human approval before sending findings to the critic.
+    """
+    if "supervisor" not in state.agent_logs:
+        state.agent_logs["supervisor"] = []
+
+    if state.human_feedback is None:
+        state.agent_logs["supervisor"].append("Pausing execution. Awaiting human validation...")
+        state.status = "PAUSED"
+    else:
+        state.agent_logs["supervisor"].append(f"Received human feedback: '{state.human_feedback}'")
+        state.status = "PROCESSING"
+        
+    return state
+
 async def critic_agent(state: SystemState) -> SystemState:
     if "critic" not in state.agent_logs:
         state.agent_logs["critic"] = []
         
-    # RETRIEVE FROM LOCAL RAG MEMORY (Vector DB)
     state.agent_logs["critic"].append("Querying Vector DB for context...")
     rag_context = vector_memory.query_memory(state.user_prompt, n_results=5)
     
     str_data = "\n---\n".join(rag_context) if rag_context else "No relevant data found."
     
+    # Inject human feedback into the evaluation prompt if present
+    feedback_injection = f"\nHuman Supervisor Feedback: {state.human_feedback}" if state.human_feedback else ""
+    
     system_prompt = "You are a stringent Critic Agent. Evaluate the retrieved semantic memory context to determine if it satisfies the user's original objective."
-    user_msg = f"Objective: {state.user_prompt}\nSemantic Memory Gathered:\n{str_data}"
+    user_msg = f"Objective: {state.user_prompt}{feedback_injection}\nSemantic Memory Gathered:\n{str_data}"
     
     try:
         eval_output = await llm.generate_structured(
@@ -129,10 +148,18 @@ def planner_router(state: SystemState) -> str:
 
 def researcher_router(state: SystemState) -> str:
     if state.status == "PROCESSING":
-        return "critic"
+        # Route to Supervisor for Human Approval instead of straight to Critic
+        return "supervisor"
     return "END"
+
+def supervisor_router(state: SystemState) -> str:
+    if state.status == "PROCESSING":
+        return "critic"
+    return "END" # Will end up here if status is PAUSED
 
 def critic_router(state: SystemState) -> str:
     if state.status == "REVISE":
+        # Clear feedback so the supervisor triggers a pause again next cycle
+        state.human_feedback = None 
         return "researcher"
     return "END"

@@ -7,82 +7,80 @@ NodeFunction = Callable[[SystemState], Awaitable[SystemState]]
 RouterFunction = Callable[[SystemState], str]
 
 class AsyncGraphOrchestrator:
-    def __init__(self):
+    """
+    A zero-dependency, high-performance State Machine Orchestrator.
+    Executes native Python asyncio nodes strictly mapped to deterministic routing edges.
+    """
+    def __init__(self, max_iterations: int = 15):
         self.nodes: Dict[str, NodeFunction] = {}
         self.routers: Dict[str, RouterFunction] = {}
-        self.entry_point: str | None = None
+        self.max_iterations = max_iterations
 
-    def add_node(self, name: str, func: NodeFunction) -> None:
+    def add_node(self, name: str, func: NodeFunction, router: RouterFunction):
+        """Registers a compute node and its outbound routing logic."""
         self.nodes[name] = func
+        self.routers[name] = router
 
-    def add_conditional_edges(self, from_node: str, router: RouterFunction) -> None:
-        self.routers[from_node] = router
+    async def stream_execution(self, state: SystemState, entrypoint: str) -> AsyncGenerator[str, None]:
+        """
+        Executes the graph while yielding real-time JSON telemetry chunks for HTTP streaming.
+        Stops on COMPLETED, FAILED, or PAUSED (Human-in-the-loop).
+        """
+        current_node_name = entrypoint
+        iteration_count = 0
 
-    def set_entry_point(self, name: str) -> None:
-        self.entry_point = name
-
-    async def emergency_fallback_node(self, state: SystemState) -> SystemState:
-        if "emergency_fallback" not in state.agent_logs:
-            state.agent_logs["emergency_fallback"] = []
-        state.agent_logs["emergency_fallback"].append("Infinite loop detected. Forcing completion.")
-        state.status = "COMPLETED"
-        state.shared_memory["emergency_override"] = True
-        state.plan = ["ABORTED DUE TO LOOP"]
-        return state
-
-    async def stream_orchestrate(self, state: SystemState) -> AsyncGenerator[str, None]:
-        if not self.entry_point:
-            yield f"data: {json.dumps({'error': 'Entry point not set'})}\n\n"
-            return
-
-        current_node = self.entry_point
-        state.status = "PROCESSING"
-        
-        while current_node and current_node in self.nodes:
-            # Pre-execution event
-            yield f"data: {json.dumps({'event': 'node_start', 'node': current_node, 'state_summary': state.model_dump(exclude={'shared_memory'})})}\n\n"
+        while iteration_count < self.max_iterations:
+            iteration_count += 1
             
-            # Continuous telemetry and loop breakers
-            state.loop_telemetry[current_node] = state.loop_telemetry.get(current_node, 0) + 1
-            
-            if state.loop_telemetry[current_node] > 3:
-                yield f"data: {json.dumps({'event': 'loop_detected', 'node': current_node})}\n\n"
-                try:
-                    state = await self.emergency_fallback_node(state)
-                except Exception as e:
-                    yield f"data: {json.dumps({'event': 'error', 'node': 'emergency_fallback', 'error': str(e)})}\n\n"
-                
-                yield f"data: {json.dumps({'event': 'node_complete', 'node': 'emergency_fallback', 'status': state.status})}\n\n"
+            if current_node_name not in self.nodes:
+                state.status = "FAILED"
+                yield json.dumps({"event": "error", "error": f"Node {current_node_name} not found"}) + "\n"
                 break
 
-            # Execute the node function
-            node_func = self.nodes[current_node]
+            # 1. Yield Start Event
+            yield json.dumps({
+                "event": "node_start",
+                "node": current_node_name,
+                "task_id": state.task_id
+            }) + "\n"
+
+            # 2. Execute Async Compute Node
+            node_func = self.nodes[current_node_name]
             try:
                 state = await node_func(state)
             except Exception as e:
                 state.status = "FAILED"
-                if current_node not in state.agent_logs:
-                    state.agent_logs[current_node] = []
-                state.agent_logs[current_node].append(f"Execution failed: {str(e)}")
-                yield f"data: {json.dumps({'event': 'error', 'node': current_node, 'error': str(e)})}\n\n"
-                break
-                
-            yield f"data: {json.dumps({'event': 'node_complete', 'node': current_node, 'status': state.status})}\n\n"
-
-            # Check if execution finished
-            if state.status in ["COMPLETED", "FAILED"]:
+                yield json.dumps({"event": "error", "node": current_node_name, "error": str(e)}) + "\n"
                 break
 
-            # Conditional Routing
-            if current_node in self.routers:
-                try:
-                    current_node = self.routers[current_node](state)
-                except Exception as e:
-                    state.status = "FAILED"
-                    yield f"data: {json.dumps({'event': 'routing_error', 'node': current_node, 'error': str(e)})}\n\n"
-                    break
-            else:
-                # No router means execution ends
+            # 3. Detect State Mutations / Infinite Loops
+            if not state.update_hash() and state._unchanged_iterations > 2:
+                state.status = "FAILED"
+                yield json.dumps({"event": "error", "error": "Infinite loop detected. State failed to mutate."}) + "\n"
+                break
+
+            # 4. Yield Completion Event
+            yield json.dumps({
+                "event": "node_complete",
+                "node": current_node_name,
+                "status": state.status,
+                "logs": state.agent_logs.get(current_node_name, [])
+            }) + "\n"
+
+            # 5. Check Terminal States (including PAUSED for Human-in-the-loop)
+            if state.status in ["COMPLETED", "FAILED", "PAUSED"]:
+                break
+
+            # 6. Route to Next Node
+            router_func = self.routers[current_node_name]
+            next_node = router_func(state)
+            
+            if next_node == "END":
                 break
                 
-        yield f"data: {json.dumps({'event': 'workflow_end', 'final_status': state.status})}\n\n"
+            current_node_name = next_node
+
+        # Safety catch for max iterations
+        if iteration_count >= self.max_iterations and state.status not in ["COMPLETED", "FAILED", "PAUSED"]:
+            state.status = "FAILED"
+            yield json.dumps({"event": "error", "error": "Max iterations reached without resolution."}) + "\n"
